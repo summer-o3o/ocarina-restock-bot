@@ -1,0 +1,356 @@
+"""닌텐도 스토어 상품 재입고 알림 봇."""
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timedelta, timezone
+
+# ── 확인할 상품 (추가하려면 줄을 하나 더 넣으면 돼요) ──
+PRODUCTS = [
+    {
+        "url": "https://store.nintendo.co.kr/nsj8afac4jpn",
+        "name": "젤다의 전설 시간의 오카리나",  # 알림에는 상품 페이지 제목이 우선 쓰임
+    },
+]
+
+# 한 번 실행할 때 1분 간격으로 5번 확인 (cron-job.org가 5분마다 실행)
+CHECKS_PER_RUN = 5
+CHECK_INTERVAL_SECONDS = 60
+
+STATE_FILE = "state.json"
+LOG_FILE = "log.md"
+MAX_LOG_LINES = 1000
+KST = timezone(timedelta(hours=9))
+
+BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
+CHANNEL_IDS = [c.strip() for c in os.environ.get("DISCORD_CHANNEL_IDS", "").split(",") if c.strip()]
+USER_IDS = [u.strip() for u in os.environ.get("DISCORD_USER_IDS", "").split(",") if u.strip()]
+WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+# 테스트용: 이 값이 있으면 이 주소를 한 번만 확인하고, 구매 가능이면 무조건 알림 (상태 저장 안 함)
+TEST_PRODUCT_URL = os.environ.get("TEST_PRODUCT_URL", "").strip()
+# 알림과 같이 보낼 멘션 (예: "@everyone" 또는 "<@&역할ID>"), 비워두면 멘션 없음
+MENTION = os.environ.get("RESTOCK_MENTION", "").strip()
+
+BOT_UA = "DiscordBot (https://github.com/summer-o3o/ocarina-restock-bot, 1.0)"
+BROWSER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/130.0 Safari/537.36"
+)
+
+
+def now_kst():
+    return datetime.now(KST)
+
+
+LAST_RESPONSE = {}
+_BROWSER = {}
+
+
+def fetch_simple(url):
+    """일반 요청 (브라우저를 못 쓸 때 예비용)."""
+    req = urllib.request.Request(url, headers={
+        "User-Agent": BROWSER_UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Cache-Control": "no-cache",
+    })
+    with urllib.request.urlopen(req, timeout=30) as response:
+        raw = response.read()
+        LAST_RESPONSE.clear()
+        LAST_RESPONSE.update({
+            "status": response.status,
+            "final_url": response.geturl(),
+            "server": response.headers.get("Server", ""),
+        })
+        return raw.decode("utf-8", "replace")
+
+
+def browser_page():
+    """크롬을 한 번만 띄워서 실행 동안 계속 쓴다 (보안 확인 쿠키 유지)."""
+    if "page" not in _BROWSER:
+        from playwright.sync_api import sync_playwright
+        pw = sync_playwright().start()
+        browser = pw.chromium.launch(args=["--disable-blink-features=AutomationControlled"])
+        context = browser.new_context(
+            user_agent=BROWSER_UA,
+            locale="ko-KR",
+            timezone_id="Asia/Seoul",
+            viewport={"width": 1280, "height": 900},
+        )
+        # 이미지·폰트·영상은 안 받아서 사이트 부담과 실행 시간을 줄임
+        context.route(
+            "**/*",
+            lambda route: route.abort()
+            if route.request.resource_type in ("image", "media", "font")
+            else route.continue_(),
+        )
+        _BROWSER.update(pw=pw, browser=browser, page=context.new_page())
+    return _BROWSER["page"]
+
+
+def close_browser():
+    if "browser" in _BROWSER:
+        try:
+            _BROWSER["browser"].close()
+            _BROWSER["pw"].stop()
+        except Exception:
+            pass
+        _BROWSER.clear()
+
+
+def fetch(url):
+    """
+    실제 크롬으로 페이지를 연다.
+    닌텐도 스토어는 해외 서버 접속에 자바스크립트 확인 화면(AWS WAF)을 보여줘서,
+    브라우저가 확인을 통과하고 상품 페이지가 뜰 때까지 기다린다.
+    """
+    try:
+        page = browser_page()
+    except Exception as exc:
+        print(f"브라우저를 띄우지 못해 일반 요청으로 확인해요: {exc}")
+        return fetch_simple(url)
+
+    response = page.goto(url, wait_until="domcontentloaded", timeout=45000)
+    try:
+        # 확인 화면이면 자동으로 새로고침되며 상품 페이지가 뜬다
+        page.wait_for_selector(".product-info-stock-sku .stock", timeout=30000)
+    except Exception:
+        pass
+
+    LAST_RESPONSE.clear()
+    LAST_RESPONSE.update({
+        "status": response.status if response else None,
+        "final_url": page.url,
+        "server": response.headers.get("server", "") if response else "",
+    })
+    return page.content()
+
+
+def page_title(html):
+    """상품 이름 (페이지 제목에서 사이트 이름 부분은 뺌)."""
+    m = re.search(r"<title>(.*?)</title>", html, re.S)
+    if not m:
+        return ""
+    title = re.sub(r"\s+", " ", m.group(1)).strip()
+    return re.split(r"\s*[|｜]\s*", title)[0].strip()
+
+
+def describe_page(html):
+    """판단이 안 될 때 원인을 보려고 페이지 요약을 만든다."""
+    title = re.search(r"<title>(.*?)</title>", html, re.S)
+    title = re.sub(r"\s+", " ", title.group(1)).strip()[:80] if title else "(제목 없음)"
+    r = LAST_RESPONSE
+    return (f"길이 {len(html)}자, 제목: {title}, 응답 {r.get('status')} "
+            f"server={r.get('server')} 최종주소={r.get('final_url')}")
+
+
+def detect_stock(html):
+    """
+    닌텐도 스토어(Magento) 상품 페이지에서 재고 상태를 읽는다.
+    반환: "in"(구매 가능) / "out"(품절) / "unknown"(판단 불가)
+    """
+    # 1순위: 가격 옆 재고 표시  <div class="stock unavailable" ...><span>품절</span>
+    block = re.search(r'product-info-stock-sku.*?class="stock (available|unavailable)"', html, re.S)
+    if block:
+        return "in" if block.group(1) == "available" else "out"
+
+    # 2순위: 상품 데이터의 판매 가능 여부  "is_salable":"" / "is_salable":"1"
+    salable = re.search(r'"is_salable"\s*:\s*"?(\w*)"?', html)
+    if salable:
+        return "in" if salable.group(1) in ("1", "true") else "out"
+
+    return "unknown"
+
+
+def load_state():
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_state(state):
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+
+def write_log(lines):
+    if not lines:
+        return
+
+    old = []
+    if os.path.exists(LOG_FILE):
+        with open(LOG_FILE, encoding="utf-8") as f:
+            old = f.read().splitlines()
+        if old and old[0].startswith("# "):
+            old = old[2:]
+
+    header = ["# 재입고 봇 기록", ""]
+    body = (lines + [""] + old)[:MAX_LOG_LINES]
+    with open(LOG_FILE, "w", encoding="utf-8") as f:
+        f.write("\n".join(header + body).rstrip() + "\n")
+
+
+def post(url, payload, headers):
+    body = json.dumps(payload).encode("utf-8")
+
+    for _ in range(3):
+        req = urllib.request.Request(
+            url, data=body, method="POST",
+            headers={"Content-Type": "application/json", **headers},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as response:
+                return json.loads(response.read() or b"{}")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")
+            if exc.code == 429:
+                try:
+                    wait = float(json.loads(detail).get("retry_after", 2))
+                except Exception:
+                    wait = 2
+                time.sleep(wait + 0.5)
+                continue
+            print(f"전송 실패 {exc.code}: {detail[:300]}")
+            return None
+        except Exception as exc:
+            print(f"전송 오류: {exc}")
+            return None
+    return None
+
+
+def bot_headers():
+    return {"Authorization": f"Bot {BOT_TOKEN}", "User-Agent": BOT_UA}
+
+
+def notify(title, description, color, url):
+    embed = {
+        "title": title[:256],
+        "url": url,
+        "description": description,
+        "color": color,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "footer": {"text": "닌텐도 스토어"},
+    }
+    payload = {"embeds": [embed]}
+    if MENTION:
+        payload["content"] = MENTION
+        payload["allowed_mentions"] = {"parse": ["everyone", "roles", "users"]}
+
+    sent = 0
+
+    if WEBHOOK_URL and post(WEBHOOK_URL, payload, {"User-Agent": "restock-bot"}) is not None:
+        sent += 1
+
+    for channel_id in CHANNEL_IDS:
+        if post(f"https://discord.com/api/v10/channels/{channel_id}/messages", payload, bot_headers()) is not None:
+            sent += 1
+
+    # 개인 DM (봇과 같은 서버에 있는 사람만 가능)
+    dm_payload = {"embeds": [embed]}
+    for user_id in USER_IDS:
+        dm = post("https://discord.com/api/v10/users/@me/channels",
+                  {"recipient_id": user_id}, bot_headers())
+        if dm and dm.get("id") and post(
+                f"https://discord.com/api/v10/channels/{dm['id']}/messages",
+                dm_payload, bot_headers()) is not None:
+            sent += 1
+
+    return sent
+
+
+def main():
+    if not (WEBHOOK_URL or (BOT_TOKEN and (CHANNEL_IDS or USER_IDS))):
+        sys.exit("DISCORD_BOT_TOKEN + DISCORD_CHANNEL_IDS(또는 DISCORD_USER_IDS)를 설정해 주세요.")
+
+    if TEST_PRODUCT_URL:
+        html = fetch(TEST_PRODUCT_URL)
+        status = detect_stock(html)
+        print(f"[테스트] {TEST_PRODUCT_URL} 재고 상태: {status} ({describe_page(html)})")
+        if status == "in":
+            sent = notify(
+                "🧪 [테스트] 재입고 알림",
+                f"테스트 상품이 구매 가능해서 보낸 알림이에요.\n{TEST_PRODUCT_URL}",
+                0x2ECC71,
+                TEST_PRODUCT_URL,
+            )
+            print(f"테스트 알림 전송: {sent}곳")
+        else:
+            print("테스트 상품이 구매 가능 상태가 아니라 알림을 보내지 않았어요.")
+        close_browser()
+        return
+
+    state = load_state()
+    # 예전(상품 1개) 형식 기록을 상품별 형식으로 옮김
+    if "products" not in state:
+        old = {k: state[k] for k in ("status", "changed_at") if k in state}
+        state = {"products": {PRODUCTS[0]["url"]: old} if old else {}}
+    products_state = state["products"]
+    log = []
+
+    for attempt in range(CHECKS_PER_RUN):
+        round_started = time.time()
+
+        for product in PRODUCTS:
+            url = product["url"]
+            info = products_state.setdefault(url, {})
+            stamp = now_kst().strftime("%Y-%m-%d %H:%M:%S")
+            name = info.get("name") or product["name"]
+
+            try:
+                html = fetch(url)
+                status = detect_stock(html)
+                title = page_title(html)
+                if title and status != "unknown":
+                    name = info["name"] = title
+                if status == "unknown":
+                    print(f"[{stamp}] {name}: 재고 표시를 못 찾음: {describe_page(html)}")
+            except Exception as exc:
+                status = "error"
+                print(f"[{stamp}] {name}: 페이지를 가져오지 못했어요: {exc}")
+
+            previous = info.get("status")
+            print(f"[{stamp}] {name}: {status} (이전: {previous})")
+
+            if status in ("in", "out") and status != previous:
+                if status == "in":
+                    sent = notify(
+                        f"🎮 재입고! {name}",
+                        "지금 닌텐도 스토어에서 구매할 수 있어요!",
+                        0x2ECC71,
+                        url,
+                    )
+                    log.append(f"- **{stamp}** ✅ {name}: 재입고 알림 전송 ({sent}곳)")
+                elif previous == "in":
+                    log.append(f"- **{stamp}** ❌ {name}: 다시 품절")
+                else:
+                    log.append(f"- **{stamp}** 🆕 {name}: 첫 확인, 품절 상태")
+
+                info.update(status=status, changed_at=stamp)
+                info.pop("last_problem", None)
+                save_state(state)
+
+            elif status in ("unknown", "error"):
+                # 페이지 구조가 바뀌었거나 접속이 막힌 경우. 상태는 그대로 두고 기록만
+                if info.get("last_problem") != status:
+                    log.append(f"- **{stamp}** ⚠️ {name}: 재고를 확인하지 못함 ({status})")
+                    info["last_problem"] = status
+                    save_state(state)
+            elif info.pop("last_problem", None):
+                save_state(state)
+
+        # 확인 시작 시각 기준으로 1분 간격 유지
+        if attempt < CHECKS_PER_RUN - 1:
+            time.sleep(max(0, CHECK_INTERVAL_SECONDS - (time.time() - round_started)))
+
+    save_state(state)
+    close_browser()
+    write_log(list(reversed(log)))
+
+
+if __name__ == "__main__":
+    main()

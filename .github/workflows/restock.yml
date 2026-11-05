@@ -1,0 +1,77 @@
+name: 재입고 확인
+
+on:
+  # 실행은 cron-job.org가 5분마다 workflow_dispatch로 시작함
+  # (GitHub 자체 예약까지 켜면 실행이 겹쳐서 대기 중인 실행이 취소됨)
+  workflow_dispatch:
+    inputs:
+      test_url:
+        description: "테스트용 상품 주소 (비워두면 평소처럼 실행)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: restock
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 브라우저 캐시
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-v1
+      - name: 브라우저 설치
+        run: |
+          pip install -q playwright
+          python -m playwright install --with-deps chromium
+      - name: 기록 불러오기
+        run: |
+          git fetch origin +refs/heads/data:refs/remotes/origin/data || true
+          for f in state.json log.md; do
+            if git show "origin/data:$f" > "/tmp/$f" 2>/dev/null; then
+              cp "/tmp/$f" "$f"
+            fi
+          done
+      - name: 재고 확인 및 알림
+        env:
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_CHANNEL_IDS: ${{ secrets.DISCORD_CHANNEL_IDS }}
+          DISCORD_USER_IDS: ${{ secrets.DISCORD_USER_IDS }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          RESTOCK_MENTION: ${{ secrets.RESTOCK_MENTION }}
+          TEST_PRODUCT_URL: ${{ github.event.inputs.test_url }}
+        run: python restock_bot.py
+      - name: 기록 저장 (data 브랜치)
+        if: always() && github.event.inputs.test_url == ''
+        run: |
+          [ -f state.json ] || exit 0
+          mkdir -p /tmp/state
+          cp state.json /tmp/state/
+          [ -f log.md ] && cp log.md /tmp/state/
+          git config user.name "restock-bot"
+          git config user.email "restock-bot@users.noreply.github.com"
+          if git rev-parse -q --verify origin/data >/dev/null; then
+            git checkout -q -f -B data origin/data
+          else
+            git checkout -q -f --orphan data
+            git rm -rf -q --cached .
+          fi
+          cp /tmp/state/* .
+          git add -f state.json
+          [ -f log.md ] && git add -f log.md
+          git diff --cached --quiet && exit 0
+          git commit -q -m "update state"
+          git push -q origin data
