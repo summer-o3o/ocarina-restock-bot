@@ -53,7 +53,7 @@ jobs:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           RESTOCK_MENTION: ${{ secrets.RESTOCK_MENTION }}
           TEST_PRODUCT_URL: ${{ github.event.inputs.test_url }}
-        run: python restock_bot.py
+        run: python -u restock_bot.py
       - name: 기록 저장 (data 브랜치)
         if: always() && github.event.inputs.test_url == ''
         run: |

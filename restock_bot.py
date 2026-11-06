@@ -19,6 +19,7 @@ PRODUCTS = [
 # 한 번 실행할 때 1분 간격으로 5번 확인 (cron-job.org가 5분마다 실행)
 CHECKS_PER_RUN = 5
 CHECK_INTERVAL_SECONDS = 60
+MAX_RUN_SECONDS = 6 * 60   # 워크플로 제한 시간(10분) 전에 스스로 끝냄
 
 STATE_FILE = "state.json"
 LOG_FILE = "log.md"
@@ -87,7 +88,9 @@ def browser_page():
             if route.request.resource_type in ("image", "media", "font")
             else route.continue_(),
         )
-        _BROWSER.update(pw=pw, browser=browser, page=context.new_page())
+        page = context.new_page()
+        page.set_default_timeout(45000)
+        _BROWSER.update(pw=pw, browser=browser, page=page)
     return _BROWSER["page"]
 
 
@@ -292,7 +295,13 @@ def main():
     products_state = state["products"]
     log = []
 
+    run_started = time.time()
+
     for attempt in range(CHECKS_PER_RUN):
+        # 실행이 너무 길어지면(사이트가 느릴 때) 다음 실행에 맡기고 끝냄
+        if time.time() - run_started > MAX_RUN_SECONDS:
+            print("실행 시간이 길어져 이번 확인은 여기서 마칠게요.")
+            break
         round_started = time.time()
 
         for product in PRODUCTS:
